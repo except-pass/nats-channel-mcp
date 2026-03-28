@@ -1,0 +1,3 @@
+# Agent A1 — Montgomery Wafflesworth-Pudding
+# Direct subject (messages specifically for this agent)
+agents.a1

@@ -1,0 +1,27 @@
+{
+  "name": "nats-channel-mcp",
+  "version": "0.1.0",
+  "description": "MCP channel server that bridges NATS pub/sub into Claude Code sessions as <channel> tags",
+  "type": "module",
+  "bin": {
+    "nats-channel-mcp": "./channel-server.ts"
+  },
+  "scripts": {
+    "start": "bun channel-server.ts",
+    "example": "cd examples/intro-chain && ./run.sh",
+    "test:e2e": "bash test/e2e/intro-chain.sh"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.28.0",
+    "nats": "^2.29.3"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "keywords": ["mcp", "nats", "claude", "claude-code", "agents", "channel"],
+  "license": "MIT"
+}
