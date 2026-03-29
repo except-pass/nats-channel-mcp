@@ -345,4 +345,4 @@ The channel server runs as a subprocess spawned by Claude Code (via `.mcp.json`)
 - [ ] `--subscribe` repeatable for multiple initial subjects
 - [ ] Hot subscription management via Unix socket (add/remove without restart)
 - [ ] NATS JetStream support for durable delivery
-- [ ] Tinstar integration: automatic lifecycle management + entity-hierarchy subjects
+- [ ] NATS authentication via credentials file (`--nats-creds`)
