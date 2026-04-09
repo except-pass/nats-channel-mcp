@@ -5,6 +5,10 @@
  *
  * Usage:
  *   bun channel-server.ts --name a1 --subscribe agents.a1 [--nats nats://localhost:4222]
+ *
+ * Optional --control-socket <path> enables a Unix-domain socket accepting
+ * newline-delimited JSON {action, subject} commands for hot-managing
+ * subscriptions at runtime.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -14,7 +18,8 @@ import { connect, StringCodec } from 'nats'
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, existsSync, unlinkSync } from 'node:fs'
+import { createServer as createNetServer } from 'node:net'
 
 const args = process.argv.slice(2)
 
@@ -158,6 +163,14 @@ async function subscribe(subject: string): Promise<void> {
   })()
 }
 
+async function unsubscribe(subject: string): Promise<void> {
+  const sub = activeSubs.get(subject)
+  if (!sub) return
+  sub.unsubscribe()
+  activeSubs.delete(subject)
+  console.error(`[${agentName}] unsubscribed from ${subject}`)
+}
+
 // ── Connect to Claude Code over stdio (must happen before subscribing) ────────
 
 await mcp.connect(new StdioServerTransport())
@@ -167,10 +180,73 @@ for (const subject of initialSubjects) {
   await subscribe(subject)
 }
 
+// ── Optional Unix socket control channel ─────────────────────────────────────
+// Opt-in via --control-socket <path>. When set, the server listens on a Unix
+// domain socket and accepts newline-delimited JSON commands for hot-managing
+// subscriptions at runtime:
+//
+//   {"action": "subscribe",   "subject": "agents.aria"}
+//   {"action": "unsubscribe", "subject": "agents.aria"}
+//
+// This is useful for orchestrators (e.g. session managers, dashboards) that
+// need to attach new channels to a long-running agent without restarting it.
+
+const controlSocketPath = argOptional('--control-socket')
+let ctrlServer: ReturnType<typeof createNetServer> | undefined
+
+if (controlSocketPath) {
+  if (existsSync(controlSocketPath)) {
+    try { unlinkSync(controlSocketPath) } catch {}
+  }
+
+  ctrlServer = createNetServer((client) => {
+    let buf = ''
+    client.on('data', (chunk: Buffer) => {
+      buf += chunk.toString('utf-8')
+      let nl = buf.indexOf('\n')
+      while (nl !== -1) {
+        const line = buf.slice(0, nl).trim()
+        buf = buf.slice(nl + 1)
+        nl = buf.indexOf('\n')
+        if (!line) continue
+        try {
+          const cmd = JSON.parse(line) as { action?: string; subject?: string }
+          if (cmd.action === 'subscribe' && typeof cmd.subject === 'string') {
+            subscribe(cmd.subject).catch(err =>
+              console.error(`[${agentName}] ctrl subscribe failed: ${err}`))
+          } else if (cmd.action === 'unsubscribe' && typeof cmd.subject === 'string') {
+            unsubscribe(cmd.subject).catch(err =>
+              console.error(`[${agentName}] ctrl unsubscribe failed: ${err}`))
+          } else {
+            console.error(`[${agentName}] ctrl unknown command: ${line}`)
+          }
+        } catch (err) {
+          console.error(`[${agentName}] ctrl bad JSON: ${line} (${(err as Error).message})`)
+        }
+      }
+    })
+    client.on('error', (err: Error) =>
+      console.error(`[${agentName}] ctrl client error: ${err.message}`))
+  })
+
+  ctrlServer.on('error', (err: Error) =>
+    console.error(`[${agentName}] ctrl server error: ${err.message}`))
+
+  ctrlServer.listen(controlSocketPath, () => {
+    console.error(`[${agentName}] ctrl socket listening at ${controlSocketPath}`)
+  })
+}
+
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 
 async function shutdown() {
   console.error(`[${agentName}] shutting down`)
+  if (ctrlServer) {
+    ctrlServer.close()
+    if (controlSocketPath) {
+      try { unlinkSync(controlSocketPath) } catch {}
+    }
+  }
   for (const sub of activeSubs.values()) sub.unsubscribe()
   await nc.drain()
   process.exit(0)

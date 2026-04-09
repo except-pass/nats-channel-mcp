@@ -155,9 +155,41 @@ bun channel-server.ts [options]
 | `--instructions-file <path>` | ☆ | Path to a markdown file whose contents become the MCP instructions (system prompt). Recommended. |
 | `--instructions <string>` | ☆ | Inline instructions string. Falls back to a minimal default if neither is given. |
 | `--nats <url>` | — | NATS server URL. Default: `nats://localhost:4222` |
+| `--control-socket <path>` | — | Enable the Unix-socket control channel for hot subscription management. See [Control Socket](#control-socket) below. |
 
 ★ At least one of `--subscribe` or `--topics-file` is required.  
 ☆ At least one of `--instructions-file` or `--instructions` is strongly recommended.
+
+---
+
+## Control Socket
+
+Long-running agents often need to join and leave channels without restarting. Pass `--control-socket <path>` and the server will listen on a Unix-domain socket that accepts newline-delimited JSON commands:
+
+```json
+{"action": "subscribe",   "subject": "rooms.breakout-42"}
+{"action": "unsubscribe", "subject": "rooms.breakout-42"}
+```
+
+This is intended for orchestrators (session managers, dashboards) that coordinate a fleet of agents and need to attach or detach channels at runtime. The socket is created on startup and unlinked on SIGTERM / SIGINT. Any existing file at the path is unlinked first.
+
+**Example:**
+
+```bash
+# Start an agent with a control socket
+bun channel-server.ts \
+    --name aria \
+    --subscribe agents.aria \
+    --control-socket /tmp/nats-ctrl-aria.sock
+
+# From another process, hot-subscribe
+echo '{"action":"subscribe","subject":"rooms.breakout-42"}' \
+    | nc -U -q 1 /tmp/nats-ctrl-aria.sock
+```
+
+The flag is purely opt-in: if you don't pass `--control-socket`, no socket is created and behavior is unchanged from prior versions. Errors in the control channel never affect NATS or MCP message flow — malformed JSON, unknown actions, and client disconnects are logged to stderr and the server keeps running.
+
+**Security:** the socket is created with the filesystem permissions of the user running the server. Use a directory only that user can reach (e.g. `$XDG_RUNTIME_DIR`) if you need stronger isolation. The protocol has no authentication — anyone who can `connect()` to the path can mutate the subscription list.
 
 ---
 
