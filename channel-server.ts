@@ -14,7 +14,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { connect, StringCodec } from 'nats'
+import { connect, StringCodec, type NatsConnection } from 'nats'
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
@@ -92,12 +92,47 @@ if (instructionsFile) {
   instructions = arg('--instructions', defaultInstructions)
 }
 
-// ── NATS connection ───────────────────────────────────────────────────────────
+// ── NATS connection (with auto-reconnect) ────────────────────────────────────
 
-const nc = await connect({ servers: natsUrl })
+async function connectNats(): Promise<NatsConnection> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const conn = await connect({
+        servers: natsUrl,
+        maxReconnectAttempts: -1,
+        reconnectTimeWait: 2000,
+      })
+      console.error(`[${agentName}] connected to ${natsUrl}`)
+      ;(async () => {
+        for await (const s of conn.status()) {
+          if (s.type === 'reconnect') console.error(`[${agentName}] reconnected to NATS`)
+          else if (s.type === 'disconnect') console.error(`[${agentName}] disconnected from NATS, will reconnect`)
+          else if (s.type === 'reconnecting') console.error(`[${agentName}] reconnecting to NATS...`)
+        }
+      })()
+      conn.closed().then(async (err) => {
+        console.error(`[${agentName}] NATS connection closed${err ? `: ${err}` : ''}, performing full reconnect`)
+        activeSubs.clear()
+        try {
+          nc = await connectNats()
+          for (const subject of trackedSubjects) await subscribe(subject)
+        } catch (e) {
+          console.error(`[${agentName}] full reconnect failed: ${e}`)
+        }
+      })
+      return conn
+    } catch (err) {
+      if (attempt >= 30) throw err
+      console.error(`[${agentName}] NATS connect attempt ${attempt} failed, retrying in 2s...`)
+      await new Promise(r => setTimeout(r, 2000))
+    }
+  }
+}
+
+let nc = await connectNats()
 const sc = StringCodec()
 
-// Track active subscriptions so we can hot-manage them later
+const trackedSubjects = new Set<string>(initialSubjects)
 const activeSubs = new Map<string, ReturnType<typeof nc.subscribe>>()
 
 // ── MCP server ────────────────────────────────────────────────────────────────
@@ -140,6 +175,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 // ── Subscribe to a NATS subject and bridge to Claude ─────────────────────────
 
 async function subscribe(subject: string): Promise<void> {
+  trackedSubjects.add(subject)
   if (activeSubs.has(subject)) return  // already subscribed
   const sub = nc.subscribe(subject)
   activeSubs.set(subject, sub)
@@ -164,6 +200,7 @@ async function subscribe(subject: string): Promise<void> {
 }
 
 async function unsubscribe(subject: string): Promise<void> {
+  trackedSubjects.delete(subject)
   const sub = activeSubs.get(subject)
   if (!sub) return
   sub.unsubscribe()
