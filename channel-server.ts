@@ -14,7 +14,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { connect, StringCodec, type NatsConnection } from 'nats'
+import { connect, StringCodec, headers, type NatsConnection } from 'nats'
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
@@ -39,6 +39,11 @@ function argOptional(flag: string): string | undefined {
 
 const agentName = arg('--name')
 const natsUrl   = arg('--nats', 'nats://localhost:4222')
+
+// Self-echo suppression: by default, an agent will not receive messages it
+// published itself (detected via the `x-from` header we stamp on every
+// publish). Pass --allow-self-echo to disable and receive own messages.
+const allowSelfEcho = args.includes('--allow-self-echo')
 
 // Collect all --subscribe values (repeatable)
 const initialSubjects: string[] = []
@@ -167,7 +172,9 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   if (req.params.name !== 'reply') throw new Error(`unknown tool: ${req.params.name}`)
   const { to, text } = req.params.arguments as { to: string; text: string }
-  nc.publish(to, sc.encode(text))
+  const hdrs = headers()
+  hdrs.set('x-from', agentName)
+  nc.publish(to, sc.encode(text), { headers: hdrs })
   console.error(`[${agentName}] published to ${to}: ${text.slice(0, 80)}`)
   return { content: [{ type: 'text' as const, text: `published to ${to}` }] }
 })
@@ -184,6 +191,11 @@ async function subscribe(subject: string): Promise<void> {
   ;(async () => {
     for await (const msg of sub) {
       const content = sc.decode(msg.data)
+      const fromHeader = msg.headers?.get('x-from')
+      if (!allowSelfEcho && fromHeader === agentName) {
+        console.error(`[${agentName}] dropped self-echo on ${msg.subject}: ${content.slice(0, 80)}`)
+        continue
+      }
       console.error(`[${agentName}] received on ${msg.subject}: ${content.slice(0, 80)}`)
       await mcp.notification({
         method: 'notifications/claude/channel',

@@ -156,6 +156,7 @@ bun channel-server.ts [options]
 | `--instructions <string>` | ☆ | Inline instructions string. Falls back to a minimal default if neither is given. |
 | `--nats <url>` | — | NATS server URL. Default: `nats://localhost:4222` |
 | `--control-socket <path>` | — | Enable the Unix-socket control channel for hot subscription management. See [Control Socket](#control-socket) below. |
+| `--allow-self-echo` | — | Disable self-echo suppression. By default the server stamps an `x-from: <name>` header on every publish and drops any inbound message whose `x-from` matches its own name, so agents never see their own messages bounce back on shared subjects. |
 
 ★ At least one of `--subscribe` or `--topics-file` is required.  
 ☆ At least one of `--instructions-file` or `--instructions` is strongly recommended.
