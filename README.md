@@ -157,6 +157,7 @@ bun channel-server.ts [options]
 | `--nats <url>` | — | NATS server URL. Default: `nats://localhost:4222` |
 | `--control-socket <path>` | — | Enable the Unix-socket control channel for hot subscription management. See [Control Socket](#control-socket) below. |
 | `--allow-self-echo` | — | Disable self-echo suppression. By default the server stamps an `x-from: <name>` header on every publish and drops any inbound message whose `x-from` matches its own name, so agents never see their own messages bounce back on shared subjects. |
+| `--jetstream` | — | Enable JetStream-backed durable delivery and the `replay` MCP tool. See [JetStream Mode](#jetstream-mode) below. Requires `nats-server -js`. |
 
 ★ At least one of `--subscribe` or `--topics-file` is required.  
 ☆ At least one of `--instructions-file` or `--instructions` is strongly recommended.
@@ -168,9 +169,12 @@ bun channel-server.ts [options]
 Long-running agents often need to join and leave channels without restarting. Pass `--control-socket <path>` and the server will listen on a Unix-domain socket that accepts newline-delimited JSON commands:
 
 ```json
-{"action": "subscribe",   "subject": "rooms.breakout-42"}
-{"action": "unsubscribe", "subject": "rooms.breakout-42"}
+{"action": "subscribe",      "subject": "rooms.breakout-42"}
+{"action": "unsubscribe",    "subject": "rooms.breakout-42"}
+{"action": "delete-durable", "subject": "rooms.breakout-42"}
 ```
+
+`delete-durable` is only meaningful when `--jetstream` is on. It unsubscribes and removes the durable consumer for the subject, scoped to durables this server created.
 
 This is intended for orchestrators (session managers, dashboards) that coordinate a fleet of agents and need to attach or detach channels at runtime. The socket is created on startup and unlinked on SIGTERM / SIGINT. Any existing file at the path is unlinked first.
 
@@ -191,6 +195,40 @@ echo '{"action":"subscribe","subject":"rooms.breakout-42"}' \
 The flag is purely opt-in: if you don't pass `--control-socket`, no socket is created and behavior is unchanged from prior versions. Errors in the control channel never affect NATS or MCP message flow — malformed JSON, unknown actions, and client disconnects are logged to stderr and the server keeps running.
 
 **Security:** the socket is created with the filesystem permissions of the user running the server. Use a directory only that user can reach (e.g. `$XDG_RUNTIME_DIR`) if you need stronger isolation. The protocol has no authentication — anyone who can `connect()` to the path can mutate the subscription list.
+
+---
+
+## JetStream Mode
+
+Pass `--jetstream` and the server uses [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) for durable delivery instead of core pub/sub. This fixes the main fragility of the default mode: messages published while the subscriber is down are buffered and delivered on reconnect.
+
+**Requires** `nats-server` to be running with JetStream enabled (`nats-server -js`).
+
+**What changes:**
+
+- **Durable per subscription.** Each `--subscribe SUBJ` creates a durable consumer named `${name}__${slug(SUBJ)}`. On reconnect (network blip, process restart, session resume) the consumer resumes from its last-acked sequence — messages buffered while the channel-server was offline get delivered automatically.
+- **Auto-managed stream.** The server creates a stream called `channel-mcp` on startup if it doesn't exist, with 3h retention and file storage. Subjects are the union of every `--subscribe` arg any channel-server in the fleet has seen; the subject set only grows. To change retention, use `nats stream edit channel-mcp` out of band.
+- **`replay` MCP tool.** A second tool appears on the MCP surface. Claude can call `replay(subject, since?, limit?)` to fetch historical messages. Results land as tool output, not as a channel injection, so they don't double-fire into the live inbox. The response is a JSON array of `{subject, from, ts, seq, text}` per message. `seq` is the NATS stream sequence — useful if an agent wants to dedupe across replay/live overlap.
+- **`delete-durable` socket action.** Orchestrators that manage a fleet of agents can remove a subject's durable immediately via the control socket (see above). Scoped to durables this server created.
+
+**Limitations:**
+
+- **Pauses longer than 1h lose messages.** The per-consumer `InactiveThreshold` is 1h (hardcoded). If a subscriber is gone for longer, JetStream deletes the durable; the next bind starts at "now" and messages published during the gap are skipped. Raise the constant in `channel-server.ts` if you need to survive longer pauses.
+- **At-least-once.** A duplicate delivery is possible after a crash/ack-timeout. If a message triggers a non-idempotent side-effect, the producer should include its own dedup key in the payload; this server is content-blind.
+- **`msg.ack()` is OS-pipe-level.** channel-server acks once `process.stdout.write()` accepts the buffer for the MCP notification. If Claude Code crashes between pipe receive and consumption, the ack has already fired and the message is lost to that session. This is an MCP-protocol limitation, not a JetStream one.
+
+**Example:**
+
+```bash
+# Start NATS with JetStream
+nats-server -js
+
+# Start the channel-server in JetStream mode
+bun channel-server.ts \
+    --name aria \
+    --subscribe agents.aria \
+    --jetstream
+```
 
 ---
 
@@ -315,7 +353,7 @@ See [`examples/intro-chain/`](./examples/intro-chain/) for a working end-to-end 
 | Issue | Details |
 |---|---|
 | **Tool approval prompts** | Claude asks permission before calling `reply`. Choose "don't ask again" to suppress. In sandboxed environments use `--dangerously-skip-permissions`. |
-| **Fire-and-forget delivery** | No subscriber = lost message. Start subscribers before dispatching, or use [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) for durable delivery. |
+| **Fire-and-forget by default** | Without `--jetstream`, no subscriber = lost message. Start subscribers before dispatching, or pass `--jetstream` for durable delivery (see below). |
 | **One-time startup confirmation** | `--dangerously-load-development-channels` prompts once per session. Automate: `echo 1 \| claude ...` |
 | **Research preview** | Requires Claude Code ≥ v2.1.80. The `--dangerously-load-development-channels` flag is for local development. Approved channels use `--channels plugin:name@marketplace`. |
 | **Absolute path in `.mcp.json`** | The path to `channel-server.ts` must be absolute — relative paths don't resolve correctly when Claude Code spawns the subprocess. |
@@ -377,5 +415,5 @@ The channel server runs as a subprocess spawned by Claude Code (via `.mcp.json`)
 
 - [ ] `--subscribe` repeatable for multiple initial subjects
 - [ ] Hot subscription management via Unix socket (add/remove without restart)
-- [ ] NATS JetStream support for durable delivery
+- [x] NATS JetStream support for durable delivery (`--jetstream`)
 - [ ] NATS authentication via credentials file (`--nats-creds`)
