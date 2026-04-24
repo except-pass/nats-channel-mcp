@@ -12,7 +12,7 @@
  *
  * Optional --jetstream enables durable consumers (resume buffered messages
  * after reconnect within InactiveThreshold) and registers a `replay` MCP
- * tool for explicit history lookback. See docs/design-jetstream.md.
+ * tool for explicit history lookback. See README "JetStream Mode" section.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -164,7 +164,8 @@ const trackedSubjects = new Set<string>(initialSubjects)
 const activeSubs = new Map<string, ReturnType<typeof nc.subscribe>>()
 
 // ── JetStream mode ───────────────────────────────────────────────────────────
-// Hardcoded constants — the design doc explains the choice. Override by editing.
+// Hardcoded constants. To survive longer pauses, raise JS_INACTIVE_THRESHOLD_NS.
+// To keep messages around longer, raise JS_STREAM_MAX_AGE_NS.
 const JS_STREAM_NAME = 'channel-mcp'
 const JS_STREAM_MAX_AGE_NS = 3 * 60 * 60 * 1_000_000_000   // 3h
 const JS_INACTIVE_THRESHOLD_NS = 60 * 60 * 1_000_000_000   // 1h
@@ -291,16 +292,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 function parseSince(s: string | undefined): number {
   if (!s) return JS_REPLAY_DEFAULT_SINCE_MS
-  // ISO timestamp (returns ms ago)
+  // Duration first — Date.parse will mis-coerce bare numerics like "2024" or
+  // "1" into valid dates on V8, surprising callers who meant a count of years.
+  const m = /^(\d+)\s*(ms|s|m|h|d)$/.exec(s)
+  if (m) {
+    const n = parseInt(m[1]!, 10)
+    const unit = m[2]!
+    const mul = unit === 'ms' ? 1 : unit === 's' ? 1000 : unit === 'm' ? 60_000 : unit === 'h' ? 3_600_000 : 86_400_000
+    return n * mul
+  }
   const iso = Date.parse(s)
   if (!Number.isNaN(iso)) return Math.max(0, Date.now() - iso)
-  // Duration: <number><unit>; supported units: ms, s, m, h, d
-  const m = /^(\d+)\s*(ms|s|m|h|d)$/.exec(s)
-  if (!m) throw new Error(`invalid 'since' value: ${s}`)
-  const n = parseInt(m[1]!, 10)
-  const unit = m[2]!
-  const mul = unit === 'ms' ? 1 : unit === 's' ? 1000 : unit === 'm' ? 60_000 : unit === 'h' ? 3_600_000 : 86_400_000
-  return n * mul
+  throw new Error(`invalid 'since' value: ${s}`)
 }
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
@@ -347,7 +350,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       console.error(`[${agentName}] replay ${subject} since=${since ?? '1h'} returned ${items.length} msgs`)
       return { content: [{ type: 'text' as const, text: JSON.stringify(items, null, 2) }] }
     } finally {
-      try { await jsm.consumers.delete(JS_STREAM_NAME, ephemeralName) } catch { /* best-effort */ }
+      try {
+        await jsm.consumers.delete(JS_STREAM_NAME, ephemeralName)
+      } catch (err) {
+        // Best-effort cleanup. The ephemeral has InactiveThreshold=60s so a
+        // leak self-reaps within a minute. We log so it's not invisible.
+        console.error(`[${agentName}] replay cleanup failed for ${ephemeralName}: ${(err as Error).message}`)
+      }
     }
   }
 
@@ -396,8 +405,12 @@ async function subscribeJetStream(subject: string): Promise<void> {
     for await (const m of iter) {
       try {
         await deliverToClaude(m.subject, m.data, m.headers ?? undefined, undefined)
-      } finally {
+        // Ack only on success (and on self-echo, which returns false but does
+        // not throw). Throws here mean the MCP transport rejected the
+        // notification — leave unacked so JetStream redelivers after AckWait.
         m.ack()
+      } catch (err) {
+        console.error(`[${agentName}] deliver failed on ${m.subject} seq=${m.seq}, leaving unacked: ${(err as Error).message}`)
       }
     }
   })()

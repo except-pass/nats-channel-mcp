@@ -206,10 +206,10 @@ Pass `--jetstream` and the server uses [NATS JetStream](https://docs.nats.io/nat
 
 **What changes:**
 
-- **Durable per subscription.** Each `--subscribe SUBJ` creates a durable consumer named `${name}__${slug(SUBJ)}`. On reconnect (network blip, process restart, session resume) the consumer resumes from its last-acked sequence — messages buffered while the channel-server was offline get delivered automatically.
-- **Auto-managed stream.** The server creates a stream called `channel-mcp` on startup if it doesn't exist, with 3h retention and file storage. Subjects are the union of every `--subscribe` arg any channel-server in the fleet has seen; the subject set only grows. To change retention, use `nats stream edit channel-mcp` out of band.
+- **Durable per subscription.** Each `--subscribe SUBJ` creates a durable consumer named `${name}__${slug(SUBJ)}`. On reconnect (network blip, process restart, session resume) the consumer resumes from its last-acked sequence — messages buffered while the channel-server was offline get delivered automatically. A freshly-created durable starts at "now" (`DeliverPolicy=New`), matching the empty-inbox expectation of a freshly-spawned agent; `DeliverPolicy` is frozen at consumer creation, so subsequent rebinds always resume from last-acked regardless.
+- **Auto-managed stream.** The server creates a stream called `channel-mcp` on startup if it doesn't exist, with 3h retention and file storage. Subjects are the union of every `--subscribe` arg any channel-server in the fleet has seen; the subject set only grows, and retention/storage is never modified after creation. To change retention, use `nats stream edit channel-mcp` out of band.
 - **`replay` MCP tool.** A second tool appears on the MCP surface. Claude can call `replay(subject, since?, limit?)` to fetch historical messages. Results land as tool output, not as a channel injection, so they don't double-fire into the live inbox. The response is a JSON array of `{subject, from, ts, seq, text}` per message. `seq` is the NATS stream sequence — useful if an agent wants to dedupe across replay/live overlap.
-- **`delete-durable` socket action.** Orchestrators that manage a fleet of agents can remove a subject's durable immediately via the control socket (see above). Scoped to durables this server created.
+- **`delete-durable` socket action.** Orchestrators that manage a fleet of agents can remove a subject's durable immediately via the control socket (see above). Each channel-server tracks the durable names it created in memory and refuses `delete-durable` for any name outside that set; on restart the set is lost, but the consumer's own `InactiveThreshold` reaps anything that leaks.
 
 **Limitations:**
 
