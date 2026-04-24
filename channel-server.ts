@@ -112,7 +112,20 @@ if (instructionsFile) {
 
 // ── NATS connection (with auto-reconnect) ────────────────────────────────────
 
+// Visibility hooks: tracked here so the periodic health log + the
+// `status` control-socket action + reply-failure errors all surface the
+// same view of connection health.
+let lastConnectErrorMessage: string | null = null
+let lastConnectErrorAt: string | null = null
+let lastConnectedAt: string | null = null
+let reconnectAttempts = 0
+
 async function connectNats(): Promise<NatsConnection> {
+  // Never give up. The previous 30-attempt cap silently abandoned recovery
+  // after ~60s when the broker took longer than that to come back (e.g.
+  // tinstar restart with a slow binary swap), leaving every subsequent
+  // publish to hit a closed `nc`. We back off after the first 30 attempts
+  // but keep trying forever.
   for (let attempt = 1; ; attempt++) {
     try {
       const conn = await connect({
@@ -121,6 +134,8 @@ async function connectNats(): Promise<NatsConnection> {
         reconnectTimeWait: 2000,
       })
       console.error(`[${agentName}] connected to ${natsUrl}`)
+      lastConnectedAt = new Date().toISOString()
+      reconnectAttempts = 0
       ;(async () => {
         for await (const s of conn.status()) {
           if (s.type === 'reconnect') console.error(`[${agentName}] reconnected to NATS`)
@@ -143,16 +158,24 @@ async function connectNats(): Promise<NatsConnection> {
             jsm = await nc.jetstreamManager()
             js = nc.jetstream()
           }
-          for (const subject of trackedSubjects) await subscribe(subject)
+          for (const subject of trackedSubjects) {
+            try { await subscribe(subject) }
+            catch (subErr) {
+              console.error(`[${agentName}] resubscribe failed for ${subject}: ${(subErr as Error).message}`)
+            }
+          }
         } catch (e) {
           console.error(`[${agentName}] full reconnect failed: ${e}`)
         }
       })
       return conn
     } catch (err) {
-      if (attempt >= 30) throw err
-      console.error(`[${agentName}] NATS connect attempt ${attempt} failed, retrying in 2s...`)
-      await new Promise(r => setTimeout(r, 2000))
+      reconnectAttempts = attempt
+      lastConnectErrorMessage = (err as Error).message
+      lastConnectErrorAt = new Date().toISOString()
+      const wait = attempt < 30 ? 2000 : 60_000
+      console.error(`[${agentName}] NATS connect attempt ${attempt} failed (${lastConnectErrorMessage}), retrying in ${wait / 1000}s...`)
+      await new Promise(r => setTimeout(r, wait))
     }
   }
 }
@@ -306,14 +329,52 @@ function parseSince(s: string | undefined): number {
   throw new Error(`invalid 'since' value: ${s}`)
 }
 
+function connectionStateString(): string {
+  if (nc.isClosed()) return 'CLOSED'
+  if (nc.isDraining()) return 'DRAINING'
+  return 'OPEN'
+}
+
+// Try once with the current `nc`. If it throws CONNECTION_CLOSED-style,
+// trigger a fresh connect inline and retry once. Without this, the publish
+// path silently inherits the dead `nc` even when reconnect is achievable —
+// the original cause of the OTA-hands stuck-state.
+async function publishWithRecovery(to: string, hdrs: ReturnType<typeof headers>, payload: Uint8Array): Promise<void> {
+  try {
+    nc.publish(to, payload, { headers: hdrs })
+    return
+  } catch (err) {
+    const msg = (err as Error).message
+    if (!/CONNECTION_CLOSED|connection closed|disconnected|NotConnected/i.test(msg)) throw err
+    console.error(`[${agentName}] publish saw closed connection (${msg}), attempting inline reconnect`)
+    try {
+      nc = await connectNats()
+      if (useJetStream) {
+        jsm = await nc.jetstreamManager()
+        js = nc.jetstream()
+      }
+    } catch (recErr) {
+      throw new Error(`inline reconnect failed: ${(recErr as Error).message}; original: ${msg}`)
+    }
+    nc.publish(to, payload, { headers: hdrs })
+  }
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   if (req.params.name === 'reply') {
     const { to, text } = req.params.arguments as { to: string; text: string }
     const hdrs = headers()
     hdrs.set('x-from', agentName)
-    nc.publish(to, sc.encode(text), { headers: hdrs })
-    console.error(`[${agentName}] published to ${to}: ${text.slice(0, 80)}`)
-    return { content: [{ type: 'text' as const, text: `published to ${to}` }] }
+    try {
+      await publishWithRecovery(to, hdrs, sc.encode(text))
+      console.error(`[${agentName}] published to ${to}: ${text.slice(0, 80)}`)
+      return { content: [{ type: 'text' as const, text: `published to ${to}` }] }
+    } catch (err) {
+      const message = (err as Error).message
+      console.error(`[${agentName}] publish to ${to} failed: ${message} (nats=${connectionStateString()})`)
+      const detail = `publish failed: ${message}. NATS connection state: ${connectionStateString()}, attempts: ${reconnectAttempts}, last connect error: ${lastConnectErrorMessage ?? 'none'}.`
+      return { isError: true, content: [{ type: 'text' as const, text: detail }] }
+    }
   }
 
   if (req.params.name === 'replay') {
@@ -477,14 +538,41 @@ for (const subject of initialSubjects) {
   await subscribe(subject)
 }
 
+// Periodic health heartbeat to stderr — gives a future post-mortem a trail
+// even if no caller is watching live. ~60s cadence; cheap.
+function statusSnapshot(): Record<string, unknown> {
+  return {
+    agent: agentName,
+    natsUrl,
+    natsState: connectionStateString(),
+    lastConnectedAt,
+    lastConnectErrorAt,
+    lastConnectErrorMessage,
+    reconnectAttempts,
+    subscriptions: Array.from(trackedSubjects),
+    activeCoreSubs: activeSubs.size,
+    jetstream: useJetStream,
+    activeJsConsumers: Array.from(activeJsConsumers.keys()),
+    createdDurables: Array.from(createdDurables),
+  }
+}
+setInterval(() => {
+  const s = statusSnapshot()
+  console.error(`[${agentName}] health ${JSON.stringify({ natsState: s.natsState, subs: trackedSubjects.size, jetstream: useJetStream, attempts: reconnectAttempts })}`)
+}, 60_000).unref()
+
 // ── Optional Unix socket control channel ─────────────────────────────────────
 // Opt-in via --control-socket <path>. When set, the server listens on a Unix
 // domain socket and accepts newline-delimited JSON commands for hot-managing
 // subscriptions at runtime:
 //
-//   {"action": "subscribe",   "subject": "agents.aria"}
-//   {"action": "unsubscribe", "subject": "agents.aria"}
+//   {"action": "subscribe",      "subject": "agents.aria"}
+//   {"action": "unsubscribe",    "subject": "agents.aria"}
+//   {"action": "delete-durable", "subject": "agents.aria"}    // --jetstream only
+//   {"action": "status"}                                      // returns one JSON line
 //
+// `status` writes one JSON line back to the calling client before closing,
+// so an orchestrator can poll connection health without scraping stderr.
 // This is useful for orchestrators (e.g. session managers, dashboards) that
 // need to attach new channels to a long-running agent without restarting it.
 
@@ -517,6 +605,10 @@ if (controlSocketPath) {
           } else if (cmd.action === 'delete-durable' && typeof cmd.subject === 'string') {
             deleteDurable(cmd.subject).catch(err =>
               console.error(`[${agentName}] ctrl delete-durable failed: ${err}`))
+          } else if (cmd.action === 'status') {
+            const snap = statusSnapshot()
+            console.error(`[${agentName}] status requested: ${JSON.stringify({ natsState: snap.natsState, attempts: reconnectAttempts })}`)
+            try { client.write(JSON.stringify(snap) + '\n') } catch { /* client may have hung up */ }
           } else {
             console.error(`[${agentName}] ctrl unknown command: ${line}`)
           }
