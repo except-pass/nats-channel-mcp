@@ -27,7 +27,7 @@ import {
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
 import { readFileSync, existsSync, unlinkSync } from 'node:fs'
-import { createServer as createNetServer } from 'node:net'
+import { createServer as createNetServer, createConnection as createNetConnection } from 'node:net'
 import { randomBytes } from 'node:crypto'
 
 const args = process.argv.slice(2)
@@ -579,8 +579,27 @@ setInterval(() => {
 const controlSocketPath = argOptional('--control-socket')
 let ctrlServer: ReturnType<typeof createNetServer> | undefined
 
+// Probe whether someone is actively listening on a UNIX socket path. A
+// successful client connect = live listener; refused/timed-out = stale file.
+async function isSocketLive(path: string, timeoutMs = 250): Promise<boolean> {
+  return new Promise<boolean>(resolve => {
+    const sock = createNetConnection(path)
+    const done = (alive: boolean) => {
+      try { sock.destroy() } catch {}
+      resolve(alive)
+    }
+    sock.once('connect', () => done(true))
+    sock.once('error', () => done(false))
+    setTimeout(() => done(false), timeoutMs)
+  })
+}
+
 if (controlSocketPath) {
   if (existsSync(controlSocketPath)) {
+    if (await isSocketLive(controlSocketPath)) {
+      console.error(`[${agentName}] control socket at ${controlSocketPath} is already in use by another channel-server — refusing to clobber. Exit cleanly.`)
+      process.exit(1)
+    }
     try { unlinkSync(controlSocketPath) } catch {}
   }
 

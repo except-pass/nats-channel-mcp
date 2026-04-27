@@ -165,6 +165,59 @@ if ! grep -q "subscribed to $HOT_SUBJECT.2" "$STDERR_LOG"; then
 fi
 pass "Server tolerates malformed JSON and stays up"
 
+# ── Refuse-on-collide: a second server on the same socket path must exit ────
+
+info "Starting a SECOND channel-server on the same control-socket path (should refuse)..."
+SECOND_STDERR_LOG="/tmp/nats-channel-ctrl-e2e-$$-second.stderr.log"
+bun run "$ROOT/channel-server.ts" \
+    --name "${AGENT_NAME}-second" \
+    --subscribe "${INIT_SUBJECT}.second" \
+    --nats nats://localhost:4222 \
+    --control-socket "$SOCK" \
+    < /dev/null > /dev/null 2> "$SECOND_STDERR_LOG" &
+SECOND_PID=$!
+
+# It must exit non-zero quickly; give it up to 5s
+elapsed=0
+while kill -0 "$SECOND_PID" 2>/dev/null; do
+  sleep 0.2
+  elapsed=$((elapsed + 1))
+  if [ "$elapsed" -ge 25 ]; then
+    kill -KILL "$SECOND_PID" 2>/dev/null || true
+    rm -f "$SECOND_STDERR_LOG"
+    fail "Second channel-server did not exit within 5s when control-socket was already live"
+  fi
+done
+
+# Capture exit code (don't let `set -e` abort on the expected non-zero)
+SECOND_EXIT=0
+wait "$SECOND_PID" || SECOND_EXIT=$?
+if [ "$SECOND_EXIT" -eq 0 ]; then
+  rm -f "$SECOND_STDERR_LOG"
+  fail "Second channel-server exited 0 — expected non-zero refuse-to-clobber"
+fi
+pass "Second channel-server exited non-zero (code=$SECOND_EXIT)"
+
+if ! grep -q "refusing to clobber" "$SECOND_STDERR_LOG"; then
+  cat "$SECOND_STDERR_LOG"
+  rm -f "$SECOND_STDERR_LOG"
+  fail "Second server did not log 'refusing to clobber'"
+fi
+pass "Second server logged refuse-to-clobber message"
+
+rm -f "$SECOND_STDERR_LOG"
+
+# Verify the ORIGINAL socket is still live by issuing a status command.
+info "Verifying ORIGINAL server's control socket is still live after the refused second start..."
+STATUS_OUT=$(echo '{"action":"status"}' | nc -U -q 1 "$SOCK" || true)
+if [ -z "$STATUS_OUT" ]; then
+  fail "Original control socket did not respond to status after second-server attempt"
+fi
+if ! echo "$STATUS_OUT" | grep -q "\"agent\":\"$AGENT_NAME\""; then
+  fail "Status response did not come from the ORIGINAL agent. Got: $STATUS_OUT"
+fi
+pass "Original server still owns the socket and answered status"
+
 # ── Graceful shutdown unlinks the socket ─────────────────────────────────────
 
 info "Sending SIGTERM..."
