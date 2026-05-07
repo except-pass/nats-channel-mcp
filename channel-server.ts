@@ -110,6 +110,31 @@ if (instructionsFile) {
   instructions = arg('--instructions', defaultInstructions)
 }
 
+// ── Lifecycle diagnostics ────────────────────────────────────────────────────
+// Issue #5: server occasionally closes stdio cleanly within ~10ms of the MCP
+// `initialize` reply, putting claude-code into a reconnect loop. The exit path
+// was invisible — nothing in stderr explained which of `process.exit`, an
+// uncaught exception, an unhandled rejection, or a normal end-of-event-loop
+// exit was firing. These hooks make that distinction observable so the
+// underlying cause can be diagnosed from logs alone.
+
+process.on('beforeExit', (code) => {
+  console.error(`[${agentName}] beforeExit (code=${code}) — event loop empty, no work scheduled`)
+})
+
+process.on('exit', (code) => {
+  console.error(`[${agentName}] exit (code=${code})`)
+})
+
+process.on('uncaughtException', (err) => {
+  console.error(`[${agentName}] uncaughtException: ${err?.stack ?? err}`)
+})
+
+process.on('unhandledRejection', (reason) => {
+  const stack = (reason as Error)?.stack
+  console.error(`[${agentName}] unhandledRejection: ${stack ?? reason}`)
+})
+
 // ── NATS connection (with auto-reconnect) ────────────────────────────────────
 
 // Visibility hooks: tracked here so the periodic health log + the
