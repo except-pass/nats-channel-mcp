@@ -21,6 +21,7 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import {
   connect, StringCodec, headers,
   AckPolicy, DeliverPolicy, RetentionPolicy, StorageType, DiscardPolicy, ReplayPolicy,
+  RequestStrategy,
   type NatsConnection, type JetStreamClient, type JetStreamManager, type ConsumerInfo,
 } from 'nats'
 
@@ -29,6 +30,10 @@ import {
 import { readFileSync, existsSync, unlinkSync } from 'node:fs'
 import { createServer as createNetServer, createConnection as createNetConnection } from 'node:net'
 import { randomBytes } from 'node:crypto'
+import {
+  createReplyToolHandler,
+  hasTinstarManagedReplyEnvironment,
+} from './tinstar-router-client.ts'
 
 const args = process.argv.slice(2)
 
@@ -48,6 +53,7 @@ function argOptional(flag: string): string | undefined {
 
 const agentName = arg('--name')
 const natsUrl   = arg('--nats', 'nats://localhost:4222')
+const hasManagedReplyEnvironment = hasTinstarManagedReplyEnvironment(process.env)
 
 // Self-echo suppression: by default, an agent will not receive messages it
 // published itself (detected via the `x-from` header we stamp on every
@@ -306,12 +312,20 @@ const mcp = new Server(
 // Reply tool — Claude calls this to publish back to NATS
 const replyTool = {
   name: 'reply',
-  description: 'Publish a message to a NATS subject',
+  description: hasManagedReplyEnvironment
+    ? 'Submit a message to Tinstar and return its durable acceptance receipt'
+    : 'Publish a message to a NATS subject',
   inputSchema: {
     type: 'object' as const,
     properties: {
       to:   { type: 'string', description: 'NATS subject to publish to' },
       text: { type: 'string', description: 'Message content' },
+      ...(hasManagedReplyEnvironment ? {
+        requestId: {
+          type: 'string',
+          description: 'Optional idempotency key; reuse it when retrying an ambiguous timeout',
+        },
+      } : {}),
     },
     required: ['to', 'text'],
   },
@@ -385,9 +399,13 @@ async function publishWithRecovery(to: string, hdrs: ReturnType<typeof headers>,
   }
 }
 
-mcp.setRequestHandler(CallToolRequestSchema, async req => {
-  if (req.params.name === 'reply') {
-    const { to, text } = req.params.arguments as { to: string; text: string }
+const reply = createReplyToolHandler({
+  env: process.env,
+  request: (subject, data, options) => nc.requestMany(subject, data, {
+    strategy: RequestStrategy.Timer,
+    maxWait: options.timeout,
+  }),
+  legacyReply: async ({ to, text }) => {
     const hdrs = headers()
     hdrs.set('x-from', agentName)
     try {
@@ -400,6 +418,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       const detail = `publish failed: ${message}. NATS connection state: ${connectionStateString()}, attempts: ${reconnectAttempts}, last connect error: ${lastConnectErrorMessage ?? 'none'}.`
       return { isError: true, content: [{ type: 'text' as const, text: detail }] }
     }
+  },
+})
+
+mcp.setRequestHandler(CallToolRequestSchema, async req => {
+  if (req.params.name === 'reply') {
+    const { to, text, requestId } = req.params.arguments as {
+      to: string
+      text: string
+      requestId?: string
+    }
+    return reply({ to, text, requestId })
   }
 
   if (req.params.name === 'replay') {

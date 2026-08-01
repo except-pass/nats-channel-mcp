@@ -246,6 +246,37 @@ Your instructions should tell Claude exactly which subject to publish to and whe
 
 On first use, Claude will ask for permission. Choose "Yes, and don't ask again" to suppress future prompts for that session.
 
+### Tinstar-managed replies
+
+Tinstar can opt this server into its durable delivery router by setting these
+environment variables on the MCP process:
+
+- `TINSTAR_MESSAGE_ROUTER_SUBJECT`: the Tinstar router's NATS request subject
+- `TINSTAR_SESSION_NAME`: the managed sender session
+- `TINSTAR_AGENT_INCARNATION`: the sender's current process incarnation
+- `TINSTAR_MESSAGE_ROUTER_AUTH`: the shared 32-byte request/receipt key encoded
+  as 64 lowercase hexadecimal characters
+
+All four variables are required together. Managed requests and responses use an
+authenticated `{payload, auth}` envelope, where `auth` is the lowercase
+HMAC-SHA256 of the JSON payload. `reply` only reports success after verifying
+Tinstar's authentication and receiving an `accepted` or `partial` durable
+receipt. No responder, a timeout, a rejected recipient, forged or invalid
+receipt, or an incomplete managed environment is returned to the agent as a
+visible tool error. It never falls back to raw publication in managed mode.
+Existing non-Tinstar users keep the original core-NATS publish behavior only
+when all four managed variables are absent.
+
+This authentication protects against broker peers that do not have the
+launch-scoped key. It does not isolate mutually hostile agent processes running
+as the same operating-system user, because those processes can inspect sibling
+environments or private config files. Run untrusted agents under separate OS
+users or containers.
+
+The managed tool also accepts an optional `requestId`. Callers should reuse the
+same value when retrying after an ambiguous timeout so Tinstar replays the
+original acceptance instead of treating the retry as a second message.
+
 ---
 
 ## How Messages Appear in Claude
