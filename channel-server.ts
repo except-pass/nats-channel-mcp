@@ -7,8 +7,8 @@
  *   bun channel-server.ts --name a1 --subscribe agents.a1 [--nats nats://localhost:4222]
  *
  * Optional --control-socket <path> enables a Unix-domain socket accepting
- * newline-delimited JSON {action, subject} commands for hot-managing
- * subscriptions at runtime. Actions: subscribe, unsubscribe, delete-durable.
+ * newline-delimited JSON commands for hot-managing subscriptions and for
+ * authenticated Tinstar final-mile delivery.
  *
  * Optional --jetstream enables durable consumers (resume buffered messages
  * after reconnect within InactiveThreshold) and registers a `replay` MCP
@@ -21,6 +21,7 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import {
   connect, StringCodec, headers,
   AckPolicy, DeliverPolicy, RetentionPolicy, StorageType, DiscardPolicy, ReplayPolicy,
+  RequestStrategy,
   type NatsConnection, type JetStreamClient, type JetStreamManager, type ConsumerInfo,
 } from 'nats'
 
@@ -29,6 +30,14 @@ import {
 import { readFileSync, existsSync, unlinkSync } from 'node:fs'
 import { createServer as createNetServer, createConnection as createNetConnection } from 'node:net'
 import { randomBytes } from 'node:crypto'
+import {
+  createReplyToolHandler,
+  hasTinstarManagedReplyEnvironment,
+  TINSTAR_AGENT_INCARNATION_ENV,
+  TINSTAR_MESSAGE_ROUTER_AUTH_ENV,
+  TINSTAR_SESSION_NAME_ENV,
+} from './tinstar-router-client.ts'
+import { createManagedDeliveryControlHandler } from './delivery-control.ts'
 
 const args = process.argv.slice(2)
 
@@ -48,6 +57,7 @@ function argOptional(flag: string): string | undefined {
 
 const agentName = arg('--name')
 const natsUrl   = arg('--nats', 'nats://localhost:4222')
+const hasManagedReplyEnvironment = hasTinstarManagedReplyEnvironment(process.env)
 
 // Self-echo suppression: by default, an agent will not receive messages it
 // published itself (detected via the `x-from` header we stamp on every
@@ -306,12 +316,20 @@ const mcp = new Server(
 // Reply tool — Claude calls this to publish back to NATS
 const replyTool = {
   name: 'reply',
-  description: 'Publish a message to a NATS subject',
+  description: hasManagedReplyEnvironment
+    ? 'Submit a message to Tinstar and return its durable acceptance receipt'
+    : 'Publish a message to a NATS subject',
   inputSchema: {
     type: 'object' as const,
     properties: {
       to:   { type: 'string', description: 'NATS subject to publish to' },
       text: { type: 'string', description: 'Message content' },
+      ...(hasManagedReplyEnvironment ? {
+        requestId: {
+          type: 'string',
+          description: 'Optional idempotency key; reuse it when retrying an ambiguous timeout',
+        },
+      } : {}),
     },
     required: ['to', 'text'],
   },
@@ -385,9 +403,13 @@ async function publishWithRecovery(to: string, hdrs: ReturnType<typeof headers>,
   }
 }
 
-mcp.setRequestHandler(CallToolRequestSchema, async req => {
-  if (req.params.name === 'reply') {
-    const { to, text } = req.params.arguments as { to: string; text: string }
+const reply = createReplyToolHandler({
+  env: process.env,
+  request: (subject, data, options) => nc.requestMany(subject, data, {
+    strategy: RequestStrategy.Timer,
+    maxWait: options.timeout,
+  }),
+  legacyReply: async ({ to, text }) => {
     const hdrs = headers()
     hdrs.set('x-from', agentName)
     try {
@@ -400,6 +422,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       const detail = `publish failed: ${message}. NATS connection state: ${connectionStateString()}, attempts: ${reconnectAttempts}, last connect error: ${lastConnectErrorMessage ?? 'none'}.`
       return { isError: true, content: [{ type: 'text' as const, text: detail }] }
     }
+  },
+})
+
+mcp.setRequestHandler(CallToolRequestSchema, async req => {
+  if (req.params.name === 'reply') {
+    const { to, text, requestId } = req.params.arguments as {
+      to: string
+      text: string
+      requestId?: string
+    }
+    return reply({ to, text, requestId })
   }
 
   if (req.params.name === 'replay') {
@@ -581,6 +614,19 @@ function statusSnapshot(): Record<string, unknown> {
     createdDurables: Array.from(createdDurables),
   }
 }
+
+const deliveryControl = createManagedDeliveryControlHandler({
+  sessionName: process.env[TINSTAR_SESSION_NAME_ENV] ?? '',
+  incarnation: process.env[TINSTAR_AGENT_INCARNATION_ENV]?.trim() ?? '',
+  authenticationKeyHex: process.env[TINSTAR_MESSAGE_ROUTER_AUTH_ENV],
+  subscriptions: () => Array.from(trackedSubjects),
+  notify: async ({ content, meta }) => {
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: { content, meta },
+    })
+  },
+})
 setInterval(() => {
   const s = statusSnapshot()
   console.error(`[${agentName}] health ${JSON.stringify({ natsState: s.natsState, subs: trackedSubjects.size, jetstream: useJetStream, attempts: reconnectAttempts })}`)
@@ -595,6 +641,7 @@ setInterval(() => {
 //   {"action": "unsubscribe",    "subject": "agents.aria"}
 //   {"action": "delete-durable", "subject": "agents.aria"}    // --jetstream only
 //   {"action": "status"}                                      // returns one JSON line
+//   {"action": "deliver", "envelope": {...}}                  // managed Tinstar only
 //
 // `status` writes one JSON line back to the calling client before closing,
 // so an orchestrator can poll connection health without scraping stderr.
@@ -653,6 +700,21 @@ if (controlSocketPath) {
             const snap = statusSnapshot()
             console.error(`[${agentName}] status requested: ${JSON.stringify({ natsState: snap.natsState, attempts: reconnectAttempts })}`)
             try { client.write(JSON.stringify(snap) + '\n') } catch { /* client may have hung up */ }
+          } else if (cmd.action === 'deliver') {
+            if (!deliveryControl) {
+              console.error(`[${agentName}] ctrl deliver disabled: managed incarnation or authentication is invalid`)
+              continue
+            }
+            void deliveryControl(cmd).then(response => {
+              if (!response) {
+                console.error(`[${agentName}] ctrl malformed deliver command`)
+                return
+              }
+              try { client.write(JSON.stringify(response) + '\n') } catch { /* caller disconnected */ }
+              console.error(`[${agentName}] ctrl delivery ${response.deliveryId} ${response.status}`)
+            }).catch(err => {
+              console.error(`[${agentName}] ctrl deliver failed: ${err}`)
+            })
           } else {
             console.error(`[${agentName}] ctrl unknown command: ${line}`)
           }

@@ -172,7 +172,18 @@ Long-running agents often need to join and leave channels without restarting. Pa
 {"action": "subscribe",      "subject": "rooms.breakout-42"}
 {"action": "unsubscribe",    "subject": "rooms.breakout-42"}
 {"action": "delete-durable", "subject": "rooms.breakout-42"}
+{"action": "status"}
 ```
+
+Managed Tinstar sessions also accept an authenticated `deliver` command. Its
+protocol-v1 payload carries the stable message and delivery IDs, attempt,
+router acceptance time, fenced sender and recipient identities, destination,
+and text. The envelope is HMAC-SHA256 signed with the session-scoped
+`TINSTAR_MESSAGE_ROUTER_AUTH` key. The server rejects invalid authentication,
+the wrong session/incarnation, and destinations it is not currently subscribed
+to. It writes one correlated JSON receipt only after the native
+`notifications/claude/channel` notification settles; callers must treat a lost
+receipt as ambiguous because the notification may already have been written.
 
 `delete-durable` is only meaningful when `--jetstream` is on. It unsubscribes and removes the durable consumer for the subject, scoped to durables this server created.
 
@@ -194,7 +205,7 @@ echo '{"action":"subscribe","subject":"rooms.breakout-42"}' \
 
 The flag is purely opt-in: if you don't pass `--control-socket`, no socket is created and behavior is unchanged from prior versions. Errors in the control channel never affect NATS or MCP message flow — malformed JSON, unknown actions, and client disconnects are logged to stderr and the server keeps running.
 
-**Security:** the socket is created with the filesystem permissions of the user running the server. Use a directory only that user can reach (e.g. `$XDG_RUNTIME_DIR`) if you need stronger isolation. The protocol has no authentication — anyone who can `connect()` to the path can mutate the subscription list.
+**Security:** the socket is created with the filesystem permissions of the user running the server. Use a directory only that user can reach (e.g. `$XDG_RUNTIME_DIR`) if you need stronger isolation. Subscription-management commands retain the legacy local-socket trust model; managed `deliver` commands additionally require the session-scoped HMAC described above.
 
 ---
 
@@ -245,6 +256,37 @@ Your instructions should tell Claude exactly which subject to publish to and whe
 > "When you finish your analysis, use reply(to='pipeline.done', text='<your summary>')."
 
 On first use, Claude will ask for permission. Choose "Yes, and don't ask again" to suppress future prompts for that session.
+
+### Tinstar-managed replies
+
+Tinstar can opt this server into its durable delivery router by setting these
+environment variables on the MCP process:
+
+- `TINSTAR_MESSAGE_ROUTER_SUBJECT`: the Tinstar router's NATS request subject
+- `TINSTAR_SESSION_NAME`: the managed sender session
+- `TINSTAR_AGENT_INCARNATION`: the sender's current process incarnation
+- `TINSTAR_MESSAGE_ROUTER_AUTH`: the shared 32-byte request/receipt key encoded
+  as 64 lowercase hexadecimal characters
+
+All four variables are required together. Managed requests and responses use an
+authenticated `{payload, auth}` envelope, where `auth` is the lowercase
+HMAC-SHA256 of the JSON payload. `reply` only reports success after verifying
+Tinstar's authentication and receiving an `accepted` or `partial` durable
+receipt. No responder, a timeout, a rejected recipient, forged or invalid
+receipt, or an incomplete managed environment is returned to the agent as a
+visible tool error. It never falls back to raw publication in managed mode.
+Existing non-Tinstar users keep the original core-NATS publish behavior only
+when all four managed variables are absent.
+
+This authentication protects against broker peers that do not have the
+launch-scoped key. It does not isolate mutually hostile agent processes running
+as the same operating-system user, because those processes can inspect sibling
+environments or private config files. Run untrusted agents under separate OS
+users or containers.
+
+The managed tool also accepts an optional `requestId`. Callers should reuse the
+same value when retrying after an ambiguous timeout so Tinstar replays the
+original acceptance instead of treating the retry as a second message.
 
 ---
 
