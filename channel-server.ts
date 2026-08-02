@@ -7,8 +7,8 @@
  *   bun channel-server.ts --name a1 --subscribe agents.a1 [--nats nats://localhost:4222]
  *
  * Optional --control-socket <path> enables a Unix-domain socket accepting
- * newline-delimited JSON {action, subject} commands for hot-managing
- * subscriptions at runtime. Actions: subscribe, unsubscribe, delete-durable.
+ * newline-delimited JSON commands for hot-managing subscriptions and for
+ * authenticated Tinstar final-mile delivery.
  *
  * Optional --jetstream enables durable consumers (resume buffered messages
  * after reconnect within InactiveThreshold) and registers a `replay` MCP
@@ -33,7 +33,10 @@ import { randomBytes } from 'node:crypto'
 import {
   createReplyToolHandler,
   hasTinstarManagedReplyEnvironment,
+  TINSTAR_AGENT_INCARNATION_ENV,
+  TINSTAR_MESSAGE_ROUTER_AUTH_ENV,
 } from './tinstar-router-client.ts'
+import { createManagedDeliveryControlHandler } from './delivery-control.ts'
 
 const args = process.argv.slice(2)
 
@@ -610,6 +613,19 @@ function statusSnapshot(): Record<string, unknown> {
     createdDurables: Array.from(createdDurables),
   }
 }
+
+const deliveryControl = createManagedDeliveryControlHandler({
+  agentName,
+  incarnation: process.env[TINSTAR_AGENT_INCARNATION_ENV]?.trim() ?? '',
+  authenticationKeyHex: process.env[TINSTAR_MESSAGE_ROUTER_AUTH_ENV],
+  subscriptions: () => Array.from(trackedSubjects),
+  notify: async ({ content, meta }) => {
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: { content, meta },
+    })
+  },
+})
 setInterval(() => {
   const s = statusSnapshot()
   console.error(`[${agentName}] health ${JSON.stringify({ natsState: s.natsState, subs: trackedSubjects.size, jetstream: useJetStream, attempts: reconnectAttempts })}`)
@@ -624,6 +640,7 @@ setInterval(() => {
 //   {"action": "unsubscribe",    "subject": "agents.aria"}
 //   {"action": "delete-durable", "subject": "agents.aria"}    // --jetstream only
 //   {"action": "status"}                                      // returns one JSON line
+//   {"action": "deliver", "envelope": {...}}                  // managed Tinstar only
 //
 // `status` writes one JSON line back to the calling client before closing,
 // so an orchestrator can poll connection health without scraping stderr.
@@ -682,6 +699,21 @@ if (controlSocketPath) {
             const snap = statusSnapshot()
             console.error(`[${agentName}] status requested: ${JSON.stringify({ natsState: snap.natsState, attempts: reconnectAttempts })}`)
             try { client.write(JSON.stringify(snap) + '\n') } catch { /* client may have hung up */ }
+          } else if (cmd.action === 'deliver') {
+            if (!deliveryControl) {
+              console.error(`[${agentName}] ctrl deliver disabled: managed incarnation or authentication is invalid`)
+              continue
+            }
+            void deliveryControl(cmd).then(response => {
+              if (!response) {
+                console.error(`[${agentName}] ctrl malformed deliver command`)
+                return
+              }
+              try { client.write(JSON.stringify(response) + '\n') } catch { /* caller disconnected */ }
+              console.error(`[${agentName}] ctrl delivery ${response.deliveryId} ${response.status}`)
+            }).catch(err => {
+              console.error(`[${agentName}] ctrl deliver failed: ${err}`)
+            })
           } else {
             console.error(`[${agentName}] ctrl unknown command: ${line}`)
           }

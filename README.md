@@ -172,7 +172,18 @@ Long-running agents often need to join and leave channels without restarting. Pa
 {"action": "subscribe",      "subject": "rooms.breakout-42"}
 {"action": "unsubscribe",    "subject": "rooms.breakout-42"}
 {"action": "delete-durable", "subject": "rooms.breakout-42"}
+{"action": "status"}
 ```
+
+Managed Tinstar sessions also accept an authenticated `deliver` command. Its
+protocol-v1 payload carries the stable message and delivery IDs, attempt,
+router acceptance time, fenced sender and recipient identities, destination,
+and text. The envelope is HMAC-SHA256 signed with the session-scoped
+`TINSTAR_MESSAGE_ROUTER_AUTH` key. The server rejects invalid authentication,
+the wrong session/incarnation, and destinations it is not currently subscribed
+to. It writes one correlated JSON receipt only after the native
+`notifications/claude/channel` notification settles; callers must treat a lost
+receipt as ambiguous because the notification may already have been written.
 
 `delete-durable` is only meaningful when `--jetstream` is on. It unsubscribes and removes the durable consumer for the subject, scoped to durables this server created.
 
@@ -194,7 +205,7 @@ echo '{"action":"subscribe","subject":"rooms.breakout-42"}' \
 
 The flag is purely opt-in: if you don't pass `--control-socket`, no socket is created and behavior is unchanged from prior versions. Errors in the control channel never affect NATS or MCP message flow — malformed JSON, unknown actions, and client disconnects are logged to stderr and the server keeps running.
 
-**Security:** the socket is created with the filesystem permissions of the user running the server. Use a directory only that user can reach (e.g. `$XDG_RUNTIME_DIR`) if you need stronger isolation. The protocol has no authentication — anyone who can `connect()` to the path can mutate the subscription list.
+**Security:** the socket is created with the filesystem permissions of the user running the server. Use a directory only that user can reach (e.g. `$XDG_RUNTIME_DIR`) if you need stronger isolation. Subscription-management commands retain the legacy local-socket trust model; managed `deliver` commands additionally require the session-scoped HMAC described above.
 
 ---
 
