@@ -35,6 +35,7 @@ import {
   hasTinstarManagedReplyEnvironment,
   TINSTAR_AGENT_INCARNATION_ENV,
   TINSTAR_MESSAGE_ROUTER_AUTH_ENV,
+  TINSTAR_SESSION_NAME_ENV,
 } from './tinstar-router-client.ts'
 import { createManagedDeliveryControlHandler } from './delivery-control.ts'
 
@@ -615,7 +616,7 @@ function statusSnapshot(): Record<string, unknown> {
 }
 
 const deliveryControl = createManagedDeliveryControlHandler({
-  agentName,
+  sessionName: process.env[TINSTAR_SESSION_NAME_ENV] ?? '',
   incarnation: process.env[TINSTAR_AGENT_INCARNATION_ENV]?.trim() ?? '',
   authenticationKeyHex: process.env[TINSTAR_MESSAGE_ROUTER_AUTH_ENV],
   subscriptions: () => Array.from(trackedSubjects),

@@ -89,19 +89,45 @@ function authenticated(command: unknown, payload: ClaudeChannelDeliveryPayload, 
   return timingSafeEqual(expected, actual)
 }
 
+function escapeXml(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+}
+
 function escapeAttribute(value: string): string {
-  return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')
+  return escapeXml(value).replaceAll('"', '&quot;')
 }
 
 export function formatClaudeChannelDelivery(payload: ClaudeChannelDeliveryPayload): string {
   return `<tinstar-message id="${escapeAttribute(payload.messageId)}" `
     + `delivery="${escapeAttribute(payload.deliveryId)}" attempt="${payload.attempt}" `
-    + `from="${escapeAttribute(payload.sender.sessionId)}">\n`
-    + `${payload.text}\n</tinstar-message>`
+    + `from="${escapeAttribute(payload.sender.sessionId)}" encoding="xml-escaped">\n`
+    + `${escapeXml(payload.text)}\n</tinstar-message>`
+}
+
+/** Match a concrete published subject against one valid NATS subscription. */
+export function natsSubscriptionMatches(subscription: string, subject: string): boolean {
+  const subscriptionTokens = subscription.split('.')
+  const subjectTokens = subject.split('.')
+  if (subscriptionTokens.some(token => token.length === 0)
+    || subjectTokens.some(token => token.length === 0)
+    || subjectTokens.some(token => token === '*' || token === '>')) return false
+
+  for (let index = 0; index < subscriptionTokens.length; index += 1) {
+    const token = subscriptionTokens[index]!
+    if (token === '>') {
+      return index === subscriptionTokens.length - 1 && index < subjectTokens.length
+    }
+    if (index >= subjectTokens.length) return false
+    if (token !== '*' && token !== subjectTokens[index]) return false
+  }
+  return subscriptionTokens.length === subjectTokens.length
 }
 
 export interface DeliveryControlDependencies {
-  agentName: string
+  sessionName: string
   incarnation: string
   authKey: Uint8Array
   subscriptions: () => readonly string[]
@@ -113,8 +139,9 @@ export interface DeliveryControlDependencies {
 }
 
 export function createDeliveryControlHandler(dependencies: DeliveryControlDependencies) {
-  if (!nonEmpty(dependencies.incarnation) || dependencies.authKey.byteLength !== 32) {
-    throw new Error('managed delivery requires a live incarnation and a 32-byte authentication key')
+  const sessionName = dependencies.sessionName.trim()
+  if (!sessionName || !nonEmpty(dependencies.incarnation) || dependencies.authKey.byteLength !== 32) {
+    throw new Error('managed delivery requires a session name, live incarnation, and 32-byte authentication key')
   }
   const now = dependencies.now ?? (() => new Date().toISOString())
   return async (command: unknown): Promise<ClaudeChannelDeliveryResponse | null> => {
@@ -132,7 +159,7 @@ export function createDeliveryControlHandler(dependencies: DeliveryControlDepend
       retryable,
     })
     if (payload.recipient.providerId !== 'claude'
-      || payload.recipient.sessionId !== dependencies.agentName) {
+      || payload.recipient.sessionId !== sessionName) {
       return reject('delivery recipient does not match this Claude channel', false)
     }
     if (payload.recipient.incarnation !== dependencies.incarnation) {
@@ -141,7 +168,9 @@ export function createDeliveryControlHandler(dependencies: DeliveryControlDepend
     if (!authenticated(command, payload, dependencies.authKey)) {
       return reject('delivery authentication failed', false)
     }
-    if (!dependencies.subscriptions().includes(payload.destination.subject)) {
+    if (!dependencies.subscriptions().some(subscription => (
+      natsSubscriptionMatches(subscription, payload.destination.subject)
+    ))) {
       return reject(`Claude channel is not subscribed to ${payload.destination.subject}`, true)
     }
     // Once notification starts, an error cannot prove that no bytes reached
@@ -179,19 +208,22 @@ export function createManagedDeliveryControlHandler(
   dependencies: ManagedDeliveryControlDependencies,
 ): ReturnType<typeof createDeliveryControlHandler> | null {
   const {
+    sessionName: rawSessionName,
     incarnation: rawIncarnation,
     authenticationKeyHex: rawAuthenticationKeyHex,
     ...handlerDependencies
   } = dependencies
+  const sessionName = rawSessionName.trim()
   const incarnation = rawIncarnation?.trim() ?? ''
   const authenticationKeyHex = rawAuthenticationKeyHex?.trim() ?? ''
-  if (!incarnation || !/^[0-9a-f]{64}$/i.test(authenticationKeyHex)) return null
+  if (!sessionName || !incarnation || !/^[0-9a-f]{64}$/i.test(authenticationKeyHex)) return null
 
   const authKey = Buffer.from(authenticationKeyHex, 'hex')
   if (authKey.byteLength !== 32) return null
 
   return createDeliveryControlHandler({
     ...handlerDependencies,
+    sessionName,
     incarnation,
     authKey,
   })
