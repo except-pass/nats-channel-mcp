@@ -89,22 +89,11 @@ function authenticated(command: unknown, payload: ClaudeChannelDeliveryPayload, 
   return timingSafeEqual(expected, actual)
 }
 
-function escapeXml(value: string): string {
-  return value
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-}
-
-function escapeAttribute(value: string): string {
-  return escapeXml(value).replaceAll('"', '&quot;')
-}
-
 export function formatClaudeChannelDelivery(payload: ClaudeChannelDeliveryPayload): string {
-  return `<tinstar-message id="${escapeAttribute(payload.messageId)}" `
-    + `delivery="${escapeAttribute(payload.deliveryId)}" attempt="${payload.attempt}" `
-    + `from="${escapeAttribute(payload.sender.sessionId)}" encoding="xml-escaped">\n`
-    + `${escapeXml(payload.text)}\n</tinstar-message>`
+  // Keep the notification body byte-for-byte identical to the accepted
+  // message. Delivery identity belongs in the notification's structured meta
+  // object below, where user-controlled text cannot imitate or terminate it.
+  return payload.text
 }
 
 /** Match a concrete published subject against one valid NATS subscription. */
